@@ -73,12 +73,12 @@ class Logger:
             json.dump(json_object, file, indent=4)
 
         print(f"\n{t} - {description}\n")
-    
+
     def addFrameMetadata(self, frame_name, frame_data):
         import json
 
         logdata = {
-            frame_name : frame_data,
+            frame_name: frame_data,
         }
 
         with open("log.json", "r+") as file:
@@ -89,7 +89,6 @@ class Logger:
             file.seek(0)
             # convert back to json.
             json.dump(json_object, file, indent=4)
-
 
     def error(self, exctype, value, traceback):
         import json
@@ -194,9 +193,9 @@ def generateGeotiff(
     )
 
     if downsample == True:
-        out_name = os.path.join(folder, out_filename+'_uncompressed.tif')
+        out_name = os.path.join(folder, out_filename + "_uncompressed.tif")
     else:
-        out_name = os.path.join(folder, out_filename+'.tif')
+        out_name = os.path.join(folder, out_filename + ".tif")
 
     os.system(
         f"gdalwarp \
@@ -381,12 +380,20 @@ def argparse():
         help="Determines whether to run autoRIFT step.",
     )
     parser.add_argument(
+        "--geocode-autoRIFT",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        dest="geocodeAutoRIFT",
+        required=False,
+        help="Determines whether to geocode the produced autoRIFT offsets pixelwise",
+    )
+    parser.add_argument(
         "--geocode",
         default=True,
         action=argparse.BooleanOptionalAction,
         dest="geocode",
         required=False,
-        help="Determines whether to geocode the produced offset from each generator (ampcor, denseAmpcor, autoRIFT).",
+        help="Determines whether to geocode the produced offset imagewise from each generator (ampcor, denseAmpcor, autoRIFT).",
     )
     parser.add_argument(
         "--previews",
@@ -414,7 +421,10 @@ def generatePreviews():
 
     print("\nGeocoding and subsampling reference .slc image using GDAL:\n")
 
-    in_filename = "reference_slc_crop/reference.slc"
+    if os.path.exists("reference_slc_crop/reference.slc"):
+        in_filename = "reference_slc_crop/reference.slc"
+    else:
+        in_filename = "reference_slc/reference.slc"
 
     in_ds = gdal.Open(in_filename, gdal.GA_ReadOnly)
     in_array = np.fliplr(np.abs(in_ds.GetRasterBand(1).ReadAsArray()))
@@ -426,7 +436,10 @@ def generatePreviews():
 
     print("\nGeocoding and subsampling secondary .slc image using GDAL:\n")
 
-    in_filename = "coregisteredSlc/refined_coreg.slc"
+    if os.path.exists("secondary_slc_crop/secondary.slc"):
+        in_filename = "secondary_slc_crop/secondary.slc"
+    else:
+        in_filename = "secondary_slc/secondary.slc"
 
     in_ds = gdal.Open(in_filename, gdal.GA_ReadOnly)
     in_array = np.fliplr(np.abs(in_ds.GetRasterBand(1).ReadAsArray()))
@@ -554,6 +567,26 @@ def geocodeOffsets(inps):
                 Geometry,
             )
 
+            print(f"\nGeocoding pixel magnitude offset:\n")
+
+            magarray = np.sqrt(yarray**2 + xarray**2)
+
+            generateGeotiff(
+                magarray,
+                "magnitude_radar",
+                os.path.join("geocoded_offsets", geocode["program"]),
+                Geometry,
+            )
+
+            magarray_conv = np.sqrt(yarray_conv**2 + xarray_conv**2)
+
+            generateGeotiff(
+                magarray_conv,
+                "magnitude",
+                os.path.join("geocoded_offsets", geocode["program"]),
+                Geometry,
+            )
+
         elif geocode["program"] == "Ampcor" and inps.ignore_ampcor == False:
             os.system(f"rm -rf {os.path.join('geocoded_offsets', geocode['program'])}")
             os.mkdir(os.path.join("geocoded_offsets", geocode["program"]))
@@ -604,11 +637,122 @@ def geocodeOffsets(inps):
             # generateGeotiff(yarray, "azimuth", geocode['program'], Geometry)
 
 
+def geocodeAutoRIFT(inps):
+    """This function specifically geocodes the .mat file and transfers it to an xyz type table for use in plotting, implicitly uses the ISCE geometry files"""
+    from osgeo import gdal
+    import numpy as np
+
+    print(" - Importing .mat file\n")
+
+    try:
+        import h5py
+
+        offset = h5py.File("offset.mat", "r")
+    except:
+        import scipy.io as sio
+
+        offset = sio.loadmat("offset.mat")
+
+    dx = offset["Dx"]
+    dy = offset["Dy"]
+
+    print(" - Reading ISCE geometry files\n")
+
+    lats = gdal.Open("geometry/lat.rdr.full")
+    lons = gdal.Open("geometry/lon.rdr.full")
+    zs = gdal.Open("geometry/z.rdr.full")
+    loss = gdal.Open("geometry/los.rdr.full")
+
+    lat = np.array(lats.GetRasterBand(1).ReadAsArray())
+    lon = np.array(lons.GetRasterBand(1).ReadAsArray())
+    z = np.array(zs.GetRasterBand(1).ReadAsArray())
+    los = np.array(loss.GetRasterBand(1).ReadAsArray())
+    head = np.array(loss.GetRasterBand(2).ReadAsArray())
+
+    lats = None
+    lons = None
+    zs = None
+    loss = None
+
+    off_height, off_width = np.shape(dx)
+
+    isce_height, isce_width = np.shape(lat)
+
+    print("AutoRIFT dimensions:", off_height, off_width)
+
+    print("ISCE dimensions:", isce_height, isce_width)
+
+    height_conv = isce_height / off_height
+    width_conv = isce_width / off_width
+
+    print("\n - Interpolating ISCE geometry files for application to AutoRIFT offsets\n")
+
+    def interpolate(array, isce_width, isce_height, off_width, off_height):
+        from scipy.interpolate import RegularGridInterpolator
+
+        xrange = lambda x: np.linspace(0, 1, x)
+
+        f = RegularGridInterpolator(
+            (xrange(isce_width), xrange(isce_height)),
+            array.T,
+            method="linear",
+            bounds_error=False,
+        )
+
+        xxnew, yynew = np.meshgrid(
+            xrange(off_width), xrange(off_height), indexing="ij", sparse=True
+        )
+
+        interp = f((xxnew, yynew)).T
+
+        return interp
+
+    interp_lat = interpolate(lat, isce_width, isce_height, off_width, off_height)
+    interp_lon = interpolate(lon, isce_width, isce_height, off_width, off_height)
+    interp_z = interpolate(z, isce_width, isce_height, off_width, off_height)
+    interp_los = interpolate(los, isce_width, isce_height, off_width, off_height)
+    interp_head = interpolate(head, isce_width, isce_height, off_width, off_height)
+
+    print(" - Saving data file\n")
+
+
+    valid_vals = np.empty(shape=(0, 7))
+
+    for i in range(off_height):
+        for j in range(off_width):
+            if not np.isnan(dx[i, j]):
+                valid_vals = np.append(
+                    valid_vals,
+                    [
+                        [
+                            dx[i, j],
+                            dy[i, j],
+                            interp_lat[i, j],
+                            interp_lon[i, j],
+                            interp_z[i, j],
+                            interp_los[i, j],
+                            interp_head[i, j]
+                        ]
+                    ],
+                    axis=0,
+                )
+
+    print(f"Number of valid autoRIFT values: {len(valid_vals)}")
+
+    np.savetxt(
+        "geocoded_offsets/AutoRIFT.data",
+        valid_vals,
+        fmt="%25.15f",
+        delimiter=",",
+        header="Dx, Dy, Lat, Lon, z, incidence, heading",
+    )
+
+
 def runAutoRIFT():
     import os
 
     os.system(
-        "scripts/testautoRIFT.py -m reference_slc_crop/reference.slc -s coregisteredSlc/refined_coreg.slc"
+        "scripts/testautoRIFT.py -m reference_slc_crop/reference.slc -s secondary_slc_crop/secondary.slc"
     )
 
 
@@ -738,7 +882,7 @@ def runISCE():
     if path.exists("demLat*"):
         os.system("rm demLat*")
 
-    os.system("stripmapApp.py stripmapApp.xml --start=startup --end=refined_resample")
+    os.system("stripmapApp.py stripmapApp.xml --start=startup --end=topo")
 
     # os.system(
     #         "stripmapApp.py stripmapApp.xml --start=startup --end=formslc"
@@ -765,7 +909,6 @@ def init(logger, file1, file2, demfile):
     os.system("rm -rf reference*")
     os.system("rm -rf secondary*")
     os.system("rm *.xml")
-
 
     print("Files selected:\n" + file1 + "\n" + file2)
 
@@ -808,8 +951,8 @@ def init(logger, file1, file2, demfile):
         reference = file2
         secondary = file1
 
-    logger.addFrameMetadata('reference', reference)
-    logger.addFrameMetadata('secondary', secondary)
+    logger.addFrameMetadata("reference", reference)
+    logger.addFrameMetadata("secondary", secondary)
 
     print(
         "Reference:\n  Name:          "
@@ -875,142 +1018,203 @@ def init(logger, file1, file2, demfile):
 
     # Unpack images:
 
-    print("\n - Unpacking images...")
+    if reference["sensor"] == "ERS 1" or reference["sensor"] == "ERS 2":
+        print("\n - Unpacking images...")
 
-    print("\nReference:\n")
+        print("\nReference:\n")
 
-    os.system(f"tar -zvxf {reference['fileloc']} --directory ./reference")
+        os.system(f"tar -zvxf {reference['fileloc']} --directory ./reference")
 
-    print("\nSecondary:\n")
+        print("\nSecondary:\n")
 
-    os.system(f"tar -zvxf {secondary['fileloc']} --directory ./secondary")
+        os.system(f"tar -zvxf {secondary['fileloc']} --directory ./secondary")
+    else:
+        print("\n - No images to unpack...")
 
     # Generate XML-files
 
     print("\n - Generating XML-files...")
 
-    # reference
-    if reference["sensor"] == "ERS 1":
-        reference_orbitloc = "/home/data/orbits/ODR/ERS1"
-    elif reference["sensor"] == "ERS 2":
-        reference_orbitloc = "/home/data/orbits/ODR/ERS2"
+    if reference["sensor"] == "ERS 1" or reference["sensor"] == "ERS 2":
+        # reference
+        if reference["sensor"] == "ERS 1":
+            reference_orbitloc = "/home/data/orbits/ODR/ERS1"
+        elif reference["sensor"] == "ERS 2":
+            reference_orbitloc = "/home/data/orbits/ODR/ERS2"
 
-    print("\nreference.xml:")
+        print("\nreference.xml:")
 
-    reference_xml = f"""
-    <component name="Reference">
-        <property name="IMAGEFILE">
-            ./reference/DAT_01.001
-        </property>
-        <property name="LEADERFILE">
-            ./reference/LEA_01.001
-        </property>
-        <property name="OUTPUT">reference</property>
-        <property name="ORBIT_TYPE">
-            <value>ODR</value>
-        </property>
-        <property name="ORBIT_DIRECTORY">
-            <value>{reference_orbitloc}</value>
-        </property>
-    </component>"""
+        reference_xml = f"""
+        <component name="Reference">
+            <property name="IMAGEFILE">
+                ./reference/DAT_01.001
+            </property>
+            <property name="LEADERFILE">
+                ./reference/LEA_01.001
+            </property>
+            <property name="OUTPUT">reference</property>
+            <property name="ORBIT_TYPE">
+                <value>ODR</value>
+            </property>
+            <property name="ORBIT_DIRECTORY">
+                <value>{reference_orbitloc}</value>
+            </property>
+        </component>"""
 
-    print(reference_xml)
+        print(reference_xml)
 
-    f = open("reference.xml", "w")
-    f.write(reference_xml)
-    f.close()
+        f = open("reference.xml", "w")
+        f.write(reference_xml)
+        f.close()
 
-    # secondary
-    if secondary["sensor"] == "ERS 1":
-        secondary_orbitloc = "/home/data/orbits/ODR/ERS1"
-    elif secondary["sensor"] == "ERS 2":
-        secondary_orbitloc = "/home/data/orbits/ODR/ERS2"
+        # secondary
+        if secondary["sensor"] == "ERS 1":
+            secondary_orbitloc = "/home/data/orbits/ODR/ERS1"
+        elif secondary["sensor"] == "ERS 2":
+            secondary_orbitloc = "/home/data/orbits/ODR/ERS2"
 
-    print("\nsecondary.xml:")
+        print("\nsecondary.xml:")
 
-    secondary_xml = f"""
-    <component name="Secondary">
-        <property name="IMAGEFILE">
-            ./secondary/DAT_01.001
-        </property>
-        <property name="LEADERFILE">
-            ./secondary/LEA_01.001
-        </property>
-        <property name="OUTPUT">secondary</property>
-        <property name="ORBIT_TYPE">
-            <value>ODR</value>
-        </property>
-        <property name="ORBIT_DIRECTORY">
-            <value>{secondary_orbitloc}</value>
-        </property>
-    </component>"""
+        secondary_xml = f"""
+        <component name="Secondary">
+            <property name="IMAGEFILE">
+                ./secondary/DAT_01.001
+            </property>
+            <property name="LEADERFILE">
+                ./secondary/LEA_01.001
+            </property>
+            <property name="OUTPUT">secondary</property>
+            <property name="ORBIT_TYPE">
+                <value>ODR</value>
+            </property>
+            <property name="ORBIT_DIRECTORY">
+                <value>{secondary_orbitloc}</value>
+            </property>
+        </component>"""
 
-    print(secondary_xml)
+        print(secondary_xml)
 
-    f = open("secondary.xml", "w")
-    f.write(secondary_xml)
-    f.close()
+        f = open("secondary.xml", "w")
+        f.write(secondary_xml)
+        f.close()
 
-    # stripmapApp.xml
-    print("\nstripmapApp.xml:")
+        # stripmapApp.xml
+        print("\nstripmapApp.xml:")
 
-    # DEM_loc = "/home/data/DEM/LMI/ArcticDEM/v1/Iceland_10m.dem"  # "/home/yad2/DEM/IslandsDEMv1.0_2x2m_zmasl_isn93_SouthMerge.tif"
+        # DEM_loc = "/home/data/DEM/LMI/ArcticDEM/v1/Iceland_10m.dem"  # "/home/yad2/DEM/IslandsDEMv1.0_2x2m_zmasl_isn93_SouthMerge.tif"
 
-    stripmapApp_xml = f"""
-    <stripmapApp>
-        <component name="insar">
-            <property  name="Sensor name">ERS</property>
-            <component name="reference">
-                <catalog>reference.xml</catalog>
+        stripmapApp_xml = f"""
+        <stripmapApp>
+            <component name="insar">
+                <property  name="Sensor name">ERS</property>
+                <component name="reference">
+                    <catalog>reference.xml</catalog>
+                </component>
+                <component name="secondary">
+                    <catalog>secondary.xml</catalog>
+                </component>
+                <property name="demFilename">{demfile}</property>
+                <property name="do denseoffsets">True</property>
+                <!--<property name="regionOfInterest">[63.615914,63.697878,-19.500389,-19.240837]</property>-->
             </component>
-            <component name="secondary">
-                <catalog>secondary.xml</catalog>
+        </stripmapApp>"""
+
+        print(stripmapApp_xml)
+
+        f = open("stripmapApp.xml", "w")
+        f.write(stripmapApp_xml)
+        f.close()
+    elif reference["sensor"] == "TSX1":
+        print("\nreference.xml:")
+
+        reference_xml = f"""
+        <component name="Reference">
+            <property name="XML">
+                {reference["fileloc"]}
+            </property>
+            <property name="OUTPUT">reference</property>
+        </component>"""
+
+        print(reference_xml)
+
+        f = open("reference.xml", "w")
+        f.write(reference_xml)
+        f.close()
+
+        print("\nsecondary.xml:")
+
+        secondary_xml = f"""
+        <component name="Secondary">
+            <property name="XML">
+                {secondary["fileloc"]}
+            </property>
+            <property name="OUTPUT">secondary</property>
+        </component>"""
+
+        print(secondary_xml)
+
+        f = open("secondary.xml", "w")
+        f.write(secondary_xml)
+        f.close()
+
+        # stripmapApp.xml
+        print("\nstripmapApp.xml:")
+
+        # DEM_loc = "/home/data/DEM/LMI/ArcticDEM/v1/Iceland_10m.dem"  # "/home/yad2/DEM/IslandsDEMv1.0_2x2m_zmasl_isn93_SouthMerge.tif"
+
+        stripmapApp_xml = f"""
+        <stripmapApp>
+            <component name="insar">
+                <property  name="Sensor name">TerraSARX</property>
+                <component name="reference">
+                    <catalog>reference.xml</catalog>
+                </component>
+                <component name="secondary">
+                    <catalog>secondary.xml</catalog>
+                </component>
+                <property name="demFilename">{demfile}</property>
+                <property name="do denseoffsets">True</property>
+                <property name="regionOfInterest">[63.699855,63.583704,-19.476357,-19.205132]</property>
             </component>
-            <property name="demFilename">{demfile}</property>
-            <property name="do denseoffsets">True</property>
-            <property name="regionOfInterest">[63.699855,63.583704,-19.476357,-19.205132]</property>
-        </component>
-    </stripmapApp>"""
+        </stripmapApp>"""
 
-    print(stripmapApp_xml)
+        print(stripmapApp_xml)
 
-    f = open("stripmapApp.xml", "w")
-    f.write(stripmapApp_xml)
-    f.close()
+        f = open("stripmapApp.xml", "w")
+        f.write(stripmapApp_xml)
+        f.close()
+
 
 def copyToDest(logger, destination):
     import json
     import os
     import glob
 
-    print("Destination: "+destination)
+    print("Destination: " + destination)
 
     if os.path.exists(destination) == False:
         print("*** creating destination folder ***")
         os.mkdir(destination)
 
-    
-    log = open('log.json')
+    log = open("log.json")
     logdata = json.load(log)
 
     reference = logdata["frame_metadata"][0]["reference"]
     secondary = logdata["frame_metadata"][1]["secondary"]
-    
-    subfolder = reference['begintime'][:10].replace("-", "")+'-'+secondary['begintime'][:10].replace("-", "")
 
-    print("\nSubfolder: "+subfolder)
+    subfolder = (
+        reference["begintime"][:10].replace("-", "")
+        + "-"
+        + secondary["begintime"][:10].replace("-", "")
+    )
+
+    print("\nSubfolder: " + subfolder)
 
     if os.path.exists(os.path.join(destination, subfolder)) == False:
         print("*** creating subfolder ***")
         os.mkdir(os.path.join(destination, subfolder))
 
-    to_copy = [
-        "preview",
-        "geocoded_offsets",
-        "log.json",
-        "isce.log",
-        "offset.mat"
-    ]
+    to_copy = ["preview", "geocoded_offsets", "log.json", "isce.log", "offset.mat"]
 
     for xml in glob.glob("*.xml"):
         to_copy.append(xml)
@@ -1020,6 +1224,7 @@ def copyToDest(logger, destination):
     for origin_folder in to_copy:
         if os.path.exists(origin_folder):
             os.system(f"cp -Rv {origin_folder} {os.path.join(destination, subfolder)}")
+
 
 ### Main loop
 
@@ -1124,6 +1329,17 @@ def main():
         logger.log("geocode_end", "Geocoding offsets finished")
     else:
         logger.log("geocode_skip", "Geocoding offsets skipped...")
+
+    ### Geocode offsets
+
+    if inps.geocodeAutoRIFT == True:
+        logger.log("geocode_autoRIFT_start", "Starting geocoding autoRIFT")
+
+        geocodeAutoRIFT(inps)
+
+        logger.log("geocode_autoRIFT_end", "Geocoding autoRIFT finished")
+    else:
+        logger.log("geocode_autoRIFT_skip", "Geocoding autoRIFT skipped...")
 
     ### Generate previews
 
